@@ -109,10 +109,10 @@ Your Excel file should contain:
 
 | Model | Best For | Speed | Accuracy | Complexity |
 |-------|----------|-------|----------|------------|
-| **DLinear** | Linear trends, stable data | Fast | Good | Low |
-| **PatchTST** | Complex patterns, long sequences | Medium | Excellent | Medium |
-| **LSTM-Paper** | 5-gas joint prediction | Medium | Very Good | Medium |
-| **TimesNet** | Multi-periodic patterns | Slow | Excellent | High |
+| DLinear | Linear trends, stable data | Fast | Good | Low |
+| PatchTST | Complex patterns, long sequences | Medium | Excellent | Medium |
+| LSTM-Paper | 5-gas joint prediction | Medium | Very Good | Medium |
+| TimesNet | Multi-periodic patterns | Slow | Excellent | High |
 
 ## Output Files
 
