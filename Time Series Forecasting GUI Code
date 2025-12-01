@@ -1,9 +1,3 @@
-"""
-FULLY FUNCTIONAL GUI FOR TIME SERIES FORECASTING
-All models self-contained - No external dependencies
-Complete with working predictions, saving, plotting, and K-Fold Cross Validation
-"""
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import pandas as pd
