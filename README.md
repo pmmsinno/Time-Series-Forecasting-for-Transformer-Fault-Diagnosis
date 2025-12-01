@@ -155,8 +155,8 @@ Reduce future_periods (forecasts degrade beyond 6 months for monthly data)
 Use K-Fold to ensure model reliability
 Check if training data covers similar patterns
 
-📧 Support
+Support
 For questions, issues, or contributions, please open an issue on GitHub or contact [amsinno06@gmail.com].
-📄 License
+License
 [MIT]
  
