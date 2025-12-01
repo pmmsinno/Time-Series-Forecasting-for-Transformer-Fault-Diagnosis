@@ -1,0 +1,1872 @@
+"""
+FULLY FUNCTIONAL GUI FOR TIME SERIES FORECASTING
+All models self-contained - No external dependencies
+Complete with working predictions, saving, plotting, and K-Fold Cross Validation
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, TimeSeriesSplit
+from datetime import datetime
+import os
+import sys
+import threading
+import pickle
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import warnings
+import math
+warnings.filterwarnings('ignore')
+
+
+
+# ============================================
+# SELF-CONTAINED MODEL DEFINITIONS
+# ============================================
+
+class SeriesDecomposition(nn.Module):
+    """Series decomposition block for DLinear"""
+    def __init__(self, kernel_size):
+        super(SeriesDecomposition, self).__init__()
+        self.kernel_size = kernel_size
+        self.avg_pool = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
+        
+    def forward(self, x):
+        batch, seq_len, features = x.shape
+        padding_len = (self.kernel_size - 1) // 2
+        front = x[:, 0:1, :].repeat(1, padding_len, 1)
+        end = x[:, -1:, :].repeat(1, self.kernel_size - padding_len - 1, 1)
+        x_padded = torch.cat([front, x, end], dim=1)
+        x_padded = x_padded.permute(0, 2, 1)
+        x_trend = self.avg_pool(x_padded)
+        x_trend = x_trend.permute(0, 2, 1)
+        x_seasonal = x - x_trend
+        return x_seasonal, x_trend
+
+
+class LSTM_Paper(nn.Module):
+    """LSTM model from the paper: Dissolved Gas Content Prediction (Hu et al., 2020)"""
+    def __init__(self, input_size=5, hidden_size=128, output_size=5, num_layers=1):
+        super(LSTM_Paper, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM layer as described in the paper
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        
+        # Fully connected output layer
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        # x shape: (batch, seq_len, input_size)
+        batch_size = x.size(0)
+        
+        # Initialize hidden and cell states
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        
+        # Forward propagate LSTM
+        lstm_out, _ = self.lstm(x, (h0, c0))
+        
+        # Get the last time step output
+        last_output = lstm_out[:, -1, :]
+        
+        # Pass through fully connected layer
+        output = self.fc(last_output)
+        
+        # Reshape to (batch, 1, output_size) for compatibility
+        output = output.unsqueeze(1)
+        
+        return output
+
+
+class DLinear(nn.Module):
+    """DLinear model - Self-contained"""
+    def __init__(self, seq_len, pred_len, enc_in, moving_avg=25):
+        super(DLinear, self).__init__()
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.enc_in = enc_in
+        
+        # Series decomposition
+        self.decomposition = SeriesDecomposition(moving_avg)
+        
+        # Linear layers for seasonal and trend
+        self.linear_seasonal = nn.Linear(self.seq_len, self.pred_len)
+        self.linear_trend = nn.Linear(self.seq_len, self.pred_len)
+        
+        # Initialize weights
+        self.linear_seasonal.weight = nn.Parameter(
+            (1/self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
+        self.linear_trend.weight = nn.Parameter(
+            (1/self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
+    
+    def forward(self, x_enc):
+        # x_enc: [batch, seq_len, features]
+        seasonal_init, trend_init = self.decomposition(x_enc)
+        seasonal_init = seasonal_init.permute(0, 2, 1)  # [batch, features, seq_len]
+        trend_init = trend_init.permute(0, 2, 1)
+        
+        seasonal_output = self.linear_seasonal(seasonal_init)  # [batch, features, pred_len]
+        trend_output = self.linear_trend(trend_init)
+        
+        x = seasonal_output + trend_output
+        x = x.permute(0, 2, 1)  # [batch, pred_len, features]
+        return x
+
+
+class PatchTST(nn.Module):
+    """PatchTST model - Self-contained"""
+    def __init__(self, seq_len, pred_len, enc_in, patch_len=16, stride=8,
+                 d_model=128, n_heads=8, e_layers=3, d_ff=256, dropout=0.1):
+        super(PatchTST, self).__init__()
+        
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.enc_in = enc_in
+        self.patch_len = min(patch_len, seq_len // 4)
+        self.stride = stride if stride is not None else self.patch_len // 2
+        
+        # Calculate number of patches
+        self.num_patches = (self.seq_len - self.patch_len) // self.stride + 1
+        
+        # Patch embedding
+        self.patch_embedding = nn.Linear(self.patch_len * self.enc_in, d_model)
+        
+        # Positional encoding
+        self.positional_encoding = nn.Parameter(torch.randn(1, self.num_patches, d_model))
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
+        
+        # Prediction head
+        self.flatten = nn.Flatten(start_dim=-2)
+        self.linear_patch = nn.Linear(self.num_patches * d_model, self.pred_len * self.enc_in)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x_enc):
+        """
+        x_enc: [batch, seq_len, features]
+        """
+        batch_size = x_enc.shape[0]
+        
+        # Create patches
+        x_patches = []
+        for i in range(self.num_patches):
+            start_idx = i * self.stride
+            end_idx = start_idx + self.patch_len
+            patch = x_enc[:, start_idx:end_idx, :]
+            patch = patch.reshape(batch_size, -1)
+            x_patches.append(patch)
+        
+        x_patches = torch.stack(x_patches, dim=1)
+        
+        # Patch embedding
+        x_embed = self.patch_embedding(x_patches)
+        
+        # Add positional encoding
+        x_embed = x_embed + self.positional_encoding
+        
+        # Transformer encoder
+        x_encoded = self.transformer(x_embed)
+        
+        # Prediction head
+        x_flat = self.flatten(x_encoded)
+        x_flat = self.dropout(x_flat)
+        output = self.linear_patch(x_flat)
+        output = output.reshape(batch_size, self.pred_len, self.enc_in)
+        
+        return output
+
+
+class TimesNetConfig:
+    """Configuration for TimesNet model"""
+    def __init__(self, gas_name='all', seq_len=96, pred_len=24):
+        self.task_name = 'long_term_forecast'
+        self.seq_len = seq_len
+        self.label_len = seq_len // 2
+        self.pred_len = pred_len
+        
+        if gas_name == 'all':
+            self.enc_in = 5
+            self.dec_in = 5
+            self.c_out = 5
+        else:
+            self.enc_in = 1
+            self.dec_in = 1
+            self.c_out = 1
+        
+        self.d_model = 64
+        self.e_layers = 2
+        self.d_ff = 64
+        self.dropout = 0.1
+        self.embed = 'timeF'
+        self.freq = 'h'
+        self.activation = 'gelu'
+        self.top_k = 5
+        self.num_kernels = 6
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class PositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEmbedding, self).__init__()
+        pe = torch.zeros(max_len, d_model).float()
+        pe.require_grad = False
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[:, :x.size(1)]
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, c_in, d_model):
+        super(TokenEmbedding, self).__init__()
+        padding = 1 if torch.__version__ >= '1.5.0' else 2
+        self.tokenConv = nn.Conv1d(in_channels=c_in, out_channels=d_model,
+                                   kernel_size=3, padding=padding, padding_mode='circular', bias=False)
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+
+    def forward(self, x):
+        x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
+        return x
+
+class TimeFeatureEmbedding(nn.Module):
+    def __init__(self, d_model, embed_type='timeF', freq='h'):
+        super(TimeFeatureEmbedding, self).__init__()
+        freq_map = {'h': 4, 't': 5, 's': 6, 'm': 1, 'a': 1, 'w': 2, 'd': 3, 'b': 3}
+        d_inp = freq_map[freq]
+        self.embed = nn.Linear(d_inp, d_model, bias=False)
+
+    def forward(self, x):
+        return self.embed(x)
+
+class DataEmbedding(nn.Module):
+    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+        super(DataEmbedding, self).__init__()
+        self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
+        self.position_embedding = PositionalEmbedding(d_model=d_model)
+        self.temporal_embedding = TimeFeatureEmbedding(d_model=d_model, embed_type=embed_type, freq=freq)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x, x_mark):
+        if x_mark is None:
+            x = self.value_embedding(x) + self.position_embedding(x)
+        else:
+            x = self.value_embedding(x) + self.temporal_embedding(x_mark) + self.position_embedding(x)
+        return self.dropout(x)
+
+# Inception Block for TimesNet
+class Inception_Block_V1(nn.Module):
+    def __init__(self, in_channels, out_channels, num_kernels=6, init_weight=True):
+        super(Inception_Block_V1, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_kernels = num_kernels
+        kernels = []
+        for i in range(self.num_kernels):
+            kernels.append(nn.Conv2d(in_channels, out_channels, kernel_size=2 * i + 1, padding=i))
+        self.kernels = nn.ModuleList(kernels)
+        if init_weight:
+            self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        res_list = []
+        for i in range(self.num_kernels):
+            res_list.append(self.kernels[i](x))
+        res = torch.stack(res_list, dim=-1).mean(-1)
+        return res
+
+# FFT for Period Detection
+def FFT_for_Period(x, k=2):
+    xf = torch.fft.rfft(x, dim=1)
+    frequency_list = abs(xf).mean(0).mean(-1)
+    frequency_list[0] = 0
+    _, top_list = torch.topk(frequency_list, k)
+    top_list = top_list.detach().cpu().numpy()
+    period = x.shape[1] // top_list
+    return period, abs(xf).mean(-1)[:, top_list]
+
+# TimesBlock
+class TimesBlock(nn.Module):
+    def __init__(self, configs):
+        super(TimesBlock, self).__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.k = configs.top_k
+        self.conv = nn.Sequential(
+            Inception_Block_V1(configs.d_model, configs.d_ff, num_kernels=configs.num_kernels),
+            nn.GELU(),
+            Inception_Block_V1(configs.d_ff, configs.d_model, num_kernels=configs.num_kernels)
+        )
+
+    def forward(self, x):
+        B, T, N = x.size()
+        period_list, period_weight = FFT_for_Period(x, self.k)
+        res = []
+        for i in range(self.k):
+            period = period_list[i]
+            if (self.seq_len + self.pred_len) % period != 0:
+                length = (((self.seq_len + self.pred_len) // period) + 1) * period
+                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
+                out = torch.cat([x, padding], dim=1)
+            else:
+                length = (self.seq_len + self.pred_len)
+                out = x
+            out = out.reshape(B, length // period, period, N).permute(0, 3, 1, 2).contiguous()
+            out = self.conv(out)
+            out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
+            res.append(out[:, :(self.seq_len + self.pred_len), :])
+        res = torch.stack(res, dim=-1)
+        period_weight = F.softmax(period_weight, dim=1)
+        period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
+        res = torch.sum(res * period_weight, -1)
+        res = res + x
+        return res
+
+# Complete TimesNet Model
+class TimesNetModel(nn.Module):
+    def __init__(self, configs):
+        super(TimesNetModel, self).__init__()
+        self.configs = configs
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len
+        self.label_len = configs.label_len
+        self.pred_len = configs.pred_len
+        self.model = nn.ModuleList([TimesBlock(configs) for _ in range(configs.e_layers)])
+        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq, configs.dropout)
+        self.layer = configs.e_layers
+        self.layer_norm = nn.LayerNorm(configs.d_model)
+        self.predict_linear = nn.Linear(self.seq_len, self.pred_len + self.seq_len)
+        self.projection = nn.Linear(configs.d_model, configs.c_out, bias=True)
+
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x_enc /= stdev
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(0, 2, 1)
+        for i in range(self.layer):
+            enc_out = self.layer_norm(self.model[i](enc_out))
+        dec_out = self.projection(enc_out)
+        dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len + self.seq_len, 1))
+        return dec_out
+
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            return dec_out[:, -self.pred_len:, :]
+        return None
+
+# Set TimesNet as available
+TIMESNET_AVAILABLE = True
+
+# ============================================
+# DATASET CLASSES
+# ============================================
+
+class UniversalDataset(Dataset):
+    """Universal dataset for all models"""
+    def __init__(self, data, gas_name, seq_len=96, pred_len=24, scaler=None, model_type='DLinear'):
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.gas_name = gas_name
+        self.model_type = model_type
+        
+        # Process timestamps
+        data = data.copy()
+        data['Timestamp'] = pd.to_datetime(data['Timestamp'])
+        data = data.sort_values('Timestamp').reset_index(drop=True)
+        
+        # Select gas columns
+        if gas_name == 'all':
+            self.gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2']
+        else:
+            self.gas_columns = [gas_name]
+        
+        # Process gas data
+        for col in self.gas_columns:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+                data[col] = data[col].interpolate(method='linear', limit_direction='both')
+                data[col] = data[col].fillna(data[col].mean())
+        
+        # Get values
+        self.data = data[self.gas_columns].values
+        self.timestamps = data['Timestamp'].values
+        
+        # Apply scaling
+        self.scaler = scaler
+        if scaler is not None:
+            self.data = scaler.transform(self.data)
+        
+        # Create time features for TimesNet
+        if model_type == 'TimesNet':
+            self.time_features = self._create_time_features(data['Timestamp'])
+            self.label_len = seq_len // 2
+        else:
+            self.time_features = None
+            self.label_len = None
+    
+    def _create_time_features(self, dates):
+        time_feat = np.zeros((len(dates), 4))
+        for i, date in enumerate(dates):
+            if pd.notnull(date):
+                time_feat[i, 0] = date.hour / 23.0
+                time_feat[i, 1] = date.day / 31.0
+                time_feat[i, 2] = date.month / 12.0
+                time_feat[i, 3] = date.weekday() / 6.0
+        return time_feat
+    
+    def __len__(self):
+        if len(self.data) == 0:
+            return 0
+        return max(0, len(self.data) - self.seq_len - self.pred_len + 1)
+    
+    def __getitem__(self, idx):
+        seq_x = self.data[idx:idx + self.seq_len]
+        seq_y = self.data[idx + self.seq_len:idx + self.seq_len + self.pred_len]
+        
+        if self.model_type == 'TimesNet':
+            # Return TimesNet format
+            s_begin = idx
+            s_end = s_begin + self.seq_len
+            x_enc = seq_x
+            x_mark_enc = self.time_features[s_begin:s_end]
+            
+            r_begin = s_end - self.label_len
+            r_end = r_begin + self.label_len + self.pred_len
+            x_dec = np.zeros((self.label_len + self.pred_len, x_enc.shape[1]))
+            x_dec[:self.label_len] = self.data[r_begin:r_begin + self.label_len]
+            x_mark_dec = self.time_features[r_begin:r_end]
+            
+            return (torch.FloatTensor(x_enc), torch.FloatTensor(x_mark_enc),
+                    torch.FloatTensor(x_dec), torch.FloatTensor(x_mark_dec),
+                    torch.FloatTensor(seq_y))
+        else:
+            # Return DLinear/PatchTST format
+            return torch.FloatTensor(seq_x), torch.FloatTensor(seq_y)
+
+
+# ============================================
+# MAIN GUI APPLICATION
+# ============================================
+
+class TimeSeriesGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Advanced Time Series Forecasting System")
+        self.root.geometry("1300x850")
+        
+        # Variables
+        self.file_path = tk.StringVar()
+        self.model_type = tk.StringVar(value="DLinear")
+        self.gas_selection = tk.StringVar(value="all")
+        self.training_mode = tk.StringVar(value="split")
+        self.seq_len = tk.IntVar(value=96)
+        self.pred_len = tk.IntVar(value=24)
+        self.epochs = tk.IntVar(value=100)
+        self.future_periods = tk.IntVar(value=24)
+        
+        # K-Fold variables
+        self.use_kfold = tk.BooleanVar(value=False)
+        self.kfold_value = tk.IntVar(value=5)
+        
+        self.df = None
+        self.model = None
+        self.scaler = None
+        self.predictions_df = None
+        self.training_thread = None
+        
+        self.create_widgets()
+    
+    def create_widgets(self):
+        """Create the GUI interface"""
+        # Create notebook for tabs
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Style configuration
+        style = ttk.Style()
+        style.configure('Title.TLabel', font=('Arial', 16, 'bold'))
+        style.configure('Header.TLabel', font=('Arial', 11, 'bold'))
+        
+        # Main tab
+        main_tab = ttk.Frame(notebook)
+        notebook.add(main_tab, text="Main")
+        
+        # Load Model tab
+        load_model_tab = ttk.Frame(notebook)
+        notebook.add(load_model_tab, text="Load Model")
+        
+        # Error Analysis tab
+        error_tab = ttk.Frame(notebook)
+        notebook.add(error_tab, text="Error Analysis")
+        
+        # Instructions tab
+        instructions_tab = ttk.Frame(notebook)
+        notebook.add(instructions_tab, text="Help")
+        
+        # Create Error Analysis tab interface
+        error_title = ttk.Label(error_tab, text="Model Performance Analysis", style='Title.TLabel')
+        error_title.pack(pady=10)
+        
+        # Create frames for layout
+        error_main_frame = ttk.Frame(error_tab)
+        error_main_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Button to calculate errors
+        self.calc_error_btn = ttk.Button(error_main_frame, text="Calculate Error Metrics", 
+                                         command=self.calculate_error_metrics, state='disabled')
+        self.calc_error_btn.pack(pady=10)
+        
+        # Frame for metrics table
+        self.metrics_frame = ttk.LabelFrame(error_main_frame, text="Error Metrics Summary", padding="10")
+        self.metrics_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Placeholder for metrics
+        self.metrics_label = ttk.Label(self.metrics_frame, text="No metrics calculated yet", 
+                                       foreground='gray')
+        self.metrics_label.pack()
+        
+        # Frame for error plot
+        self.error_plot_frame = ttk.Frame(error_main_frame)
+        self.error_plot_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Create Load Model tab interface
+        load_title = ttk.Label(load_model_tab, text="Load Pre-Trained Model", style='Title.TLabel')
+        load_title.pack(pady=20)
+        
+        # Load model frame
+        load_frame = ttk.LabelFrame(load_model_tab, text="Model Loading", padding="20")
+        load_frame.pack(pady=10, padx=20, fill='x')
+        
+        ttk.Label(load_frame, text="Select saved model file (.pth):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.loaded_model_path = tk.StringVar()
+        ttk.Entry(load_frame, textvariable=self.loaded_model_path, width=50).grid(row=0, column=1, padx=10)
+        ttk.Button(load_frame, text="Browse", command=self.browse_model).grid(row=0, column=2)
+        
+        ttk.Button(load_frame, text="Load Model", command=self.load_saved_model, 
+                  style='Accent.TButton').grid(row=1, column=1, pady=20)
+        
+        # Model info
+        self.loaded_model_info = ttk.Label(load_frame, text="No model loaded", foreground='gray')
+        self.loaded_model_info.grid(row=2, column=0, columnspan=3, pady=10)
+        
+        # Instructions for loaded model
+        load_instructions = ttk.LabelFrame(load_model_tab, text="How to Use Loaded Models", padding="20")
+        load_instructions.pack(pady=10, padx=20, fill='both', expand=True)
+        
+        load_help_text = tk.Text(load_instructions, wrap=tk.WORD, height=15, width=80)
+        load_help_text.pack(fill='both', expand=True)
+        load_help_text.insert('1.0', """
+USING A PRE-TRAINED MODEL:
+
+1. Click "Browse" to select your saved model file (.pth)
+2. Click "Load Model" to load it
+3. The model will be ready for predictions immediately
+4. Go to Main tab and click "Predict" (no need to train again!)
+
+IMPORTANT NOTES:
+• Make sure your data file has the same format as the training data
+• The model remembers its configuration (seq_len, pred_len, gas type)
+• You can generate new predictions on new data
+• Future predictions still work with loaded models
+
+TIP: Save your best models after training to reuse them later!
+        """)
+        load_help_text.config(state='disabled')
+        
+        # Add instructions text
+        instructions_text = scrolledtext.ScrolledText(instructions_tab, wrap=tk.WORD, width=80, height=30, 
+                                                      font=('Arial', 10))
+        instructions_text.pack(fill='both', expand=True, padx=10, pady=10)
+        instructions_text.insert('1.0', """
+WELCOME TO THE TIME SERIES FORECASTING SYSTEM!
+====================================================
+
+WHAT DOES THIS TOOL DO?
+---------------------------
+This tool predicts future gas concentrations in transformers using historical data.
+
+STEP-BY-STEP GUIDE FOR BEGINNERS:
+-------------------------------------
+
+STEP 1: PREPARE YOUR DATA
+• You need an Excel file (.xlsx) with:
+  - A date/time column (named "Timestamp", "Date", or similar)
+  - One or more gas columns (H2, CH4, C2H6, C2H4, C2H2)
+• Don't worry about missing values - the tool handles them!
+
+STEP 2: CHOOSE YOUR MODEL
+• DLinear (Recommended for beginners): Fast and simple, great starting point
+• PatchTST: More advanced, better for complex patterns
+• LSTM-Paper: Implementation from Hu et al. 2020 paper - optimized for 5 gases
+• TimesNet: Best for data with multiple repeating patterns (needs extra file)
+
+Note: LSTM-Paper uses parameters optimized in the research paper:
+  - Sequence length: 30 (automatically set)
+  - Hidden neurons: 128
+  - Best for all 5 gases together (H2, CH4, C2H4, CO, CO2)
+
+STEP 3: LOAD YOUR DATA
+• Click "Browse" to find your Excel file
+• Click "Load" - the tool will automatically detect your data frequency!
+• You'll see info like "Loaded: 500 samples, daily data"
+
+STEP 4: SELECT WHAT TO PREDICT
+• Gas: Choose "All" to predict all gases, or select one specific gas
+• Mode: 
+  - "Train/Test" = Check accuracy (recommended first time)
+  - "Full Training" = Use all data for best predictions
+
+STEP 5: CHECK THE SETTINGS (or just use defaults!)
+• Seq Len: How many past points to look at (auto-detected)
+• Pred Len: How many future points to predict
+• Epochs: Training rounds (100 is usually good)
+• Future: Extra predictions beyond your data (0 = none)
+• K-Fold CV: Enable for more robust training (splits data into K parts)
+
+STEP 6: TRAIN THE MODEL
+• Click "Train" and wait
+• Watch the log for progress updates
+• When done, "Predict" button becomes available
+
+STEP 7: GENERATE PREDICTIONS
+• Click "Predict" to generate forecasts
+• This creates predictions for your existing data PLUS future if requested
+
+STEP 8: SEE YOUR RESULTS
+• Click "Plot" to see a visual graph
+• Blue line = Actual data
+• Orange line = Predictions
+• Green dashed = Future predictions
+• Click "Save Plot" in the plot window to save as image
+
+STEP 9: SAVE YOUR WORK
+• "Save Results" = Save predictions to Excel
+• "Save Model" = Save trained model to reuse later
+• "Save Plot" = Save graph as image (PNG/PDF)
+
+REUSING A MODEL:
+-------------------
+1. Go to "Load Model" tab
+2. Browse for your saved .pth file
+3. Load it - now you can predict without training again!
+
+TIPS FOR BETTER RESULTS:
+--------------------------------
+• Clean your data first (remove obvious errors)
+• Use at least 6 months of data for monthly predictions
+• If predictions look flat, try PatchTST model
+• Save good models to reuse on new data
+• Compare multiple models to find the best one
+• Try K-Fold cross validation for more robust models
+
+POTENTIAL ERRORS?
+---------------
+• Check your Excel file has the right column names
+• Make sure dates are in chronological order
+• Try with a smaller dataset first
+• Use "Train/Test" mode to check if model is learning
+        """)
+        instructions_text.config(state='disabled')
+        
+        # Title
+        title_label = ttk.Label(main_tab, text="Time Series Forecasting System", 
+                               font=('Arial', 18, 'bold'), foreground='#2C3E50')
+        title_label.grid(row=0, column=0, columnspan=3, pady=15)
+        
+        subtitle_label = ttk.Label(main_tab, text="Gas Concentration Prediction Tool", 
+                                   font=('Arial', 10, 'italic'), foreground='#7F8C8D')
+        subtitle_label.grid(row=1, column=0, columnspan=3, pady=(0, 10))
+        
+        # Model Selection
+        model_frame = ttk.LabelFrame(main_tab, text="Model Selection", padding="10")
+        model_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5, padx=5)
+        
+        ttk.Label(model_frame, text="Select Model:").grid(row=0, column=0, sticky=tk.W)
+        
+        models = ["DLinear", "PatchTST", "LSTM-Paper"]
+        if TIMESNET_AVAILABLE:
+            models.append("TimesNet")
+        
+        model_combo = ttk.Combobox(model_frame, textvariable=self.model_type, 
+                                   values=models, state="readonly", width=15)
+        model_combo.grid(row=0, column=1, padx=5)
+        
+        # File Selection
+        file_frame = ttk.LabelFrame(main_tab, text="Data File", padding="10")
+        file_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5, padx=5)
+        
+        ttk.Label(file_frame, text="Excel File:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(row=0, column=1)
+        ttk.Button(file_frame, text="Browse", command=self.browse_file).grid(row=0, column=2)
+        ttk.Button(file_frame, text="Load", command=self.load_file).grid(row=0, column=3)
+        
+        self.file_info = ttk.Label(file_frame, text="No file loaded", foreground='gray')
+        self.file_info.grid(row=1, column=0, columnspan=4, pady=5)
+        
+        # Configuration
+        config_frame = ttk.LabelFrame(main_tab, text="Configuration", padding="10")
+        config_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5, padx=5)
+        
+        # Gas Selection
+        ttk.Label(config_frame, text="Gas:").grid(row=0, column=0, sticky=tk.W)
+        gas_frame = ttk.Frame(config_frame)
+        gas_frame.grid(row=0, column=1, columnspan=3)
+        
+        for i, gas in enumerate(['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2', 'All']):
+            value = 'all' if gas == 'All' else gas
+            ttk.Radiobutton(gas_frame, text=gas, variable=self.gas_selection, 
+                          value=value).grid(row=0, column=i, padx=5)
+        
+        # Training Mode
+        ttk.Label(config_frame, text="Mode:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        mode_frame = ttk.Frame(config_frame)
+        mode_frame.grid(row=1, column=1, columnspan=2)
+        ttk.Radiobutton(mode_frame, text="Train/Test", variable=self.training_mode, 
+                       value="split").grid(row=0, column=0)
+        ttk.Radiobutton(mode_frame, text="Full Training", variable=self.training_mode, 
+                       value="full").grid(row=0, column=1)
+        
+        # Parameters
+        ttk.Label(config_frame, text="Seq Len:").grid(row=2, column=0, sticky=tk.W)
+        ttk.Spinbox(config_frame, from_=10, to=500, textvariable=self.seq_len, 
+                   width=10).grid(row=2, column=1)
+        
+        ttk.Label(config_frame, text="Pred Len:").grid(row=2, column=2)
+        ttk.Spinbox(config_frame, from_=1, to=100, textvariable=self.pred_len, 
+                   width=10).grid(row=2, column=3)
+        
+        ttk.Label(config_frame, text="Epochs:").grid(row=3, column=0, sticky=tk.W)
+        ttk.Spinbox(config_frame, from_=10, to=500, textvariable=self.epochs, 
+                   width=10).grid(row=3, column=1)
+        
+        ttk.Label(config_frame, text="Future:").grid(row=3, column=2)
+        ttk.Spinbox(config_frame, from_=0, to=365, textvariable=self.future_periods, 
+                   width=10).grid(row=3, column=3)
+        
+        # Prediction Frequency Selection
+        ttk.Label(config_frame, text="Pred Freq:").grid(row=4, column=0, sticky=tk.W)
+        self.pred_frequency = tk.StringVar(value="same")
+        pred_freq_combo = ttk.Combobox(config_frame, textvariable=self.pred_frequency,
+                                       values=["same", "daily", "weekly", "monthly", "bimonthly", "yearly"],
+                                       state="readonly", width=10)
+        pred_freq_combo.grid(row=4, column=1)
+        ttk.Label(config_frame, text="(Output frequency for predictions)").grid(row=4, column=2, columnspan=2)
+        
+        # K-Fold Cross Validation Section
+        ttk.Label(config_frame, text="K-Fold CV:").grid(row=5, column=0, sticky=tk.W)
+        kfold_frame = ttk.Frame(config_frame)
+        kfold_frame.grid(row=5, column=1, columnspan=3, sticky=tk.W)
+        
+        self.kfold_checkbox = ttk.Checkbutton(
+            kfold_frame, 
+            text="Enable", 
+            variable=self.use_kfold,
+            command=self.toggle_kfold
+        )
+        self.kfold_checkbox.grid(row=0, column=0, padx=5)
+        
+        ttk.Label(kfold_frame, text="K=").grid(row=0, column=1)
+        self.kfold_spinbox = ttk.Spinbox(
+            kfold_frame, 
+            from_=2, 
+            to=10, 
+            textvariable=self.kfold_value,
+            width=5,
+            state='disabled'
+        )
+        self.kfold_spinbox.grid(row=0, column=2, padx=5)
+        
+        ttk.Label(kfold_frame, text="(splits data into K folds for validation)").grid(row=0, column=3, padx=10)
+        
+        # When LSTM-Paper is selected, auto-set paper's optimal parameters
+        def on_model_selection_change(*args):
+            if self.model_type.get() == "LSTM-Paper":
+                self.seq_len.set(30)  # Paper's optimal sequence length
+                self.epochs.set(200)  # Paper's recommended epochs
+                self.log("LSTM-Paper selected: Using paper's optimal parameters (seq_len=30, epochs=200)")
+        
+        self.model_type.trace('w', on_model_selection_change)
+        
+        # Control Buttons
+        control_frame = ttk.Frame(main_tab)
+        control_frame.grid(row=5, column=0, columnspan=3, pady=10)
+        
+        self.train_btn = ttk.Button(control_frame, text="Train", command=self.train_model, state='disabled')
+        self.train_btn.grid(row=0, column=0, padx=5)
+        
+        self.predict_btn = ttk.Button(control_frame, text="Predict", command=self.generate_predictions, state='disabled')
+        self.predict_btn.grid(row=0, column=1, padx=5)
+        
+        self.save_btn = ttk.Button(control_frame, text="Save Results", command=self.save_results, state='disabled')
+        self.save_btn.grid(row=0, column=2, padx=5)
+        
+        self.plot_btn = ttk.Button(control_frame, text="Plot", command=self.plot_results, state='disabled')
+        self.plot_btn.grid(row=0, column=3, padx=5)
+        
+        self.save_model_btn = ttk.Button(control_frame, text="Save Model", command=self.save_model, state='disabled')
+        self.save_model_btn.grid(row=0, column=4, padx=5)
+        
+        # Progress
+        self.progress = ttk.Progressbar(main_tab, mode='indeterminate')
+        self.progress.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5, padx=5)
+        
+        # Log
+        log_frame = ttk.LabelFrame(main_tab, text="Status Log", padding="5")
+        log_frame.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=5)
+        main_tab.rowconfigure(7, weight=1)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10)
+        self.log_text.pack(fill='both', expand=True)
+        
+        self.log("Ready. Load data to begin.")
+    
+    def log(self, message):
+        """Add message to log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.root.update()
+    
+    def toggle_kfold(self):
+        """Enable/disable K-fold spinbox based on checkbox"""
+        if self.use_kfold.get():
+            self.kfold_spinbox.config(state='normal')
+            self.training_mode.set('split')  # Force to split mode for K-fold
+            self.log("K-Fold cross validation enabled")
+        else:
+            self.kfold_spinbox.config(state='disabled')
+            self.log("K-Fold cross validation disabled")
+    
+    def browse_file(self):
+        """Browse for file"""
+        filename = filedialog.askopenfilename(
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if filename:
+            self.file_path.set(filename)
+    
+    def load_file(self):
+        """Load Excel file"""
+        if not self.file_path.get():
+            messagebox.showwarning("Warning", "Select file first")
+            return
+        
+        try:
+            self.log("Loading file...")
+            self.df = pd.read_excel(self.file_path.get(), engine='openpyxl')
+            
+            # Clean data
+            self.df = self.df.loc[:, ~self.df.columns.str.contains('^Unnamed')]
+            
+            # Find timestamp column
+            for col in ['Timestamp', 'Date', 'DateTime', 'Time']:
+                if col in self.df.columns:
+                    if col != 'Timestamp':
+                        self.df = self.df.rename(columns={col: 'Timestamp'})
+                    break
+            
+            self.df['Timestamp'] = pd.to_datetime(self.df['Timestamp'], format='mixed')
+            self.df = self.df.sort_values('Timestamp').reset_index(drop=True)
+            
+            # Detect frequency
+            time_diffs = self.df['Timestamp'].diff().dropna()
+            median_diff = time_diffs.median()
+            
+            if median_diff <= pd.Timedelta(days=1.5):
+                freq = 'daily'
+                self.seq_len.set(30)
+                self.pred_len.set(7)
+            elif median_diff <= pd.Timedelta(days=8):
+                freq = 'weekly'
+                self.seq_len.set(12)
+                self.pred_len.set(4)
+            elif median_diff <= pd.Timedelta(days=32):
+                freq = 'monthly'
+                self.seq_len.set(12)
+                self.pred_len.set(3)
+            elif median_diff <= pd.Timedelta(days=64):
+                freq = 'bimonthly'
+                self.seq_len.set(6)
+                self.pred_len.set(3)
+            else:
+                freq= 'yearly'
+                self.seq_len.set(3)
+                self.pred_len.set(1)
+
+            
+            self.file_info.config(text=f"Loaded: {len(self.df)} samples, {freq} data")
+            self.log(f"Loaded {len(self.df)} samples, detected {freq} frequency")
+            self.train_btn.config(state='normal')
+            
+        except Exception as e:
+            self.log(f"Error: {str(e)}")
+            messagebox.showerror("Error", str(e))
+    
+    def train_model(self):
+        """Train model"""
+        if self.df is None:
+            return
+        
+        self.train_btn.config(state='disabled')
+        self.progress.start()
+        
+        # Run in thread
+        threading.Thread(target=self._train_thread, daemon=True).start()
+    
+    def _train_thread(self):
+        """Training thread with K-Fold cross validation support"""
+        try:
+            gas_name = self.gas_selection.get()
+            seq_len = self.seq_len.get()
+            pred_len = self.pred_len.get()
+            epochs = self.epochs.get()
+            model_type = self.model_type.get()
+            use_kfold = self.use_kfold.get()
+            k_folds = self.kfold_value.get()
+            
+            # Prepare gas columns
+            gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            
+            if use_kfold:
+                self.log(f"Training {model_type} with {k_folds}-Fold Cross Validation...")
+                
+                # Prepare all data
+                all_data = self.df.copy()
+                
+                # Process data
+                for col in gas_columns:
+                    if col in all_data.columns:
+                        all_data[col] = pd.to_numeric(all_data[col], errors='coerce')
+                        all_data[col] = all_data[col].interpolate(method='linear', limit_direction='both')
+                        all_data[col] = all_data[col].fillna(all_data[col].mean())
+                
+                # Use TimeSeriesSplit for time series data
+                tscv = TimeSeriesSplit(n_splits=k_folds)
+                fold_losses = []
+                fold_val_losses = []
+                best_model_state = None
+                best_val_loss = float('inf')
+                
+                for fold, (train_idx, val_idx) in enumerate(tscv.split(all_data), 1):
+                    self.log(f"\n--- Fold {fold}/{k_folds} ---")
+                    
+                    # Split data for this fold
+                    train_df = all_data.iloc[train_idx].copy()
+                    val_df = all_data.iloc[val_idx].copy()
+                    
+                    self.log(f"Training samples: {len(train_df)}, Validation samples: {len(val_df)}")
+                    
+                    # Prepare scaler for this fold
+                    scaler = StandardScaler()
+                    train_values = []
+                    for col in gas_columns:
+                        if col in train_df.columns:
+                            values = train_df[col].values.reshape(-1, 1)
+                            train_values.append(values)
+                    
+                    if len(gas_columns) > 1:
+                        train_values = np.hstack(train_values)
+                    else:
+                        train_values = train_values[0]
+                    
+                    scaler.fit(train_values)
+                    
+                    # Create datasets
+                    train_dataset = UniversalDataset(train_df, gas_name, seq_len, pred_len, 
+                                                    scaler, model_type)
+                    val_dataset = UniversalDataset(val_df, gas_name, seq_len, pred_len,
+                                                  scaler, model_type)
+                    
+                    if len(train_dataset) == 0 or len(val_dataset) == 0:
+                        self.log(f"Fold {fold}: Insufficient data, skipping...")
+                        continue
+                    
+                    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+                    
+                    # Create model for this fold
+                    enc_in = len(gas_columns)
+                    
+                    if model_type == "DLinear":
+                        model = DLinear(seq_len, pred_len, enc_in).to(device)
+                    elif model_type == "PatchTST":
+                        model = PatchTST(seq_len, pred_len, enc_in).to(device)
+                    elif model_type == "LSTM-Paper":
+                        if gas_name == 'all':
+                            model = LSTM_Paper(input_size=5, hidden_size=128, output_size=5).to(device)
+                            self.seq_len.set(30)
+                            seq_len = 30
+                        else:
+                            model = LSTM_Paper(input_size=1, hidden_size=128, output_size=1).to(device)
+                    elif model_type == "TimesNet":
+                        config = TimesNetConfig(gas_name, seq_len, pred_len)
+                        model = TimesNetModel(config).to(device)
+                    
+                    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+                    criterion = nn.MSELoss()
+                    
+                    # Train this fold
+                    fold_train_losses = []
+                    for epoch in range(epochs):
+                        model.train()
+                        total_loss = 0
+                        
+                        for batch in train_loader:
+                            if model_type == "TimesNet":
+                                x_enc, x_mark_enc, x_dec, x_mark_dec, y = [b.to(device) for b in batch]
+                                optimizer.zero_grad()
+                                outputs = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                                loss = criterion(outputs, y)
+                            else:
+                                x, y = batch
+                                x, y = x.to(device), y.to(device)
+                                optimizer.zero_grad()
+                                outputs = model(x)
+                                loss = criterion(outputs, y)
+                            
+                            loss.backward()
+                            optimizer.step()
+                            total_loss += loss.item()
+                        
+                        avg_train_loss = total_loss / len(train_loader)
+                        fold_train_losses.append(avg_train_loss)
+                        
+                        # Validation
+                        if epoch % 10 == 0:
+                            model.eval()
+                            val_loss = 0
+                            with torch.no_grad():
+                                for batch in val_loader:
+                                    if model_type == "TimesNet":
+                                        x_enc, x_mark_enc, x_dec, x_mark_dec, y = [b.to(device) for b in batch]
+                                        outputs = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                                        loss = criterion(outputs, y)
+                                    else:
+                                        x, y = batch
+                                        x, y = x.to(device), y.to(device)
+                                        outputs = model(x)
+                                        loss = criterion(outputs, y)
+                                    val_loss += loss.item()
+                            
+                            avg_val_loss = val_loss / len(val_loader)
+                            
+                            if (epoch + 1) % 20 == 0:
+                                self.log(f"Fold {fold} - Epoch {epoch+1}/{epochs}: "
+                                       f"Train Loss = {avg_train_loss:.6f}, Val Loss = {avg_val_loss:.6f}")
+                    
+                    # Evaluate final validation loss for this fold
+                    model.eval()
+                    final_val_loss = 0
+                    with torch.no_grad():
+                        for batch in val_loader:
+                            if model_type == "TimesNet":
+                                x_enc, x_mark_enc, x_dec, x_mark_dec, y = [b.to(device) for b in batch]
+                                outputs = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                                loss = criterion(outputs, y)
+                            else:
+                                x, y = batch
+                                x, y = x.to(device), y.to(device)
+                                outputs = model(x)
+                                loss = criterion(outputs, y)
+                            final_val_loss += loss.item()
+                    
+                    final_val_loss = final_val_loss / len(val_loader)
+                    fold_losses.append(avg_train_loss)
+                    fold_val_losses.append(final_val_loss)
+                    
+                    self.log(f"Fold {fold} completed - Final Val Loss: {final_val_loss:.6f}")
+                    
+                    # Save best model
+                    if final_val_loss < best_val_loss:
+                        best_val_loss = final_val_loss
+                        best_model_state = model.state_dict()
+                        best_scaler = scaler
+                        self.log(f"New best model found at fold {fold}")
+                
+                # Report K-Fold results
+                self.log("\n" + "="*50)
+                self.log("K-FOLD CROSS VALIDATION RESULTS")
+                self.log("="*50)
+                self.log(f"Average Training Loss: {np.mean(fold_losses):.6f} (±{np.std(fold_losses):.6f})")
+                self.log(f"Average Validation Loss: {np.mean(fold_val_losses):.6f} (±{np.std(fold_val_losses):.6f})")
+                self.log(f"Best Validation Loss: {best_val_loss:.6f}")
+                
+                # Train final model on all data with best configuration
+                self.log("\nTraining final model on all data...")
+                
+                # Use the best model and retrain on all data
+                if best_model_state is not None:
+                    # Prepare full dataset
+                    self.scaler = StandardScaler()
+                    all_values = []
+                    for col in gas_columns:
+                        if col in all_data.columns:
+                            values = all_data[col].values.reshape(-1, 1)
+                            all_values.append(values)
+                    
+                    if len(gas_columns) > 1:
+                        all_values = np.hstack(all_values)
+                    else:
+                        all_values = all_values[0]
+                    
+                    self.scaler.fit(all_values)
+                    
+                    # Create final model
+                    if model_type == "DLinear":
+                        self.model = DLinear(seq_len, pred_len, enc_in).to(device)
+                    elif model_type == "PatchTST":
+                        self.model = PatchTST(seq_len, pred_len, enc_in).to(device)
+                    elif model_type == "LSTM-Paper":
+                        if gas_name == 'all':
+                            self.model = LSTM_Paper(input_size=5, hidden_size=128, output_size=5).to(device)
+                        else:
+                            self.model = LSTM_Paper(input_size=1, hidden_size=128, output_size=1).to(device)
+                    elif model_type == "TimesNet":
+                        config = TimesNetConfig(gas_name, seq_len, pred_len)
+                        self.model = TimesNetModel(config).to(device)
+                    
+                    # Load best weights
+                    self.model.load_state_dict(best_model_state)
+                    
+                    self.log("K-Fold training complete! Best model loaded.")
+                
+            else:
+                # Original training logic (no K-fold)
+                self.log(f"Training {model_type}...")
+                
+                # Split data
+                if self.training_mode.get() == "full":
+                    train_df = self.df.copy()
+                else:
+                    split_idx = int(len(self.df) * 0.8)
+                    train_df = self.df.iloc[:split_idx].copy()
+                
+                # Prepare scaler
+                self.scaler = StandardScaler()
+                
+                train_values = []
+                for col in gas_columns:
+                    if col in train_df.columns:
+                        values = pd.to_numeric(train_df[col], errors='coerce').fillna(0)
+                        train_values.append(values.values.reshape(-1, 1))
+                
+                if len(gas_columns) > 1:
+                    train_values = np.hstack(train_values)
+                else:
+                    train_values = train_values[0]
+                
+                self.scaler.fit(train_values)
+                
+                # Create dataset
+                train_dataset = UniversalDataset(train_df, gas_name, seq_len, pred_len, 
+                                                self.scaler, model_type)
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                
+                # Create model
+                enc_in = len(gas_columns)
+                
+                if model_type == "DLinear":
+                    self.model = DLinear(seq_len, pred_len, enc_in).to(device)
+                elif model_type == "PatchTST":
+                    self.model = PatchTST(seq_len, pred_len, enc_in).to(device)
+                elif model_type == "LSTM-Paper":
+                    if gas_name == 'all':
+                        self.model = LSTM_Paper(input_size=5, hidden_size=128, output_size=5).to(device)
+                        self.seq_len.set(30)
+                        seq_len = 30
+                    else:
+                        self.model = LSTM_Paper(input_size=1, hidden_size=128, output_size=1).to(device)
+                    self.log("Using LSTM from paper with optimized parameters")
+                elif model_type == "TimesNet":
+                    config = TimesNetConfig(gas_name, seq_len, pred_len)
+                    self.model = TimesNetModel(config).to(device)
+                
+                optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+                criterion = nn.MSELoss()
+                
+                # Train
+                for epoch in range(epochs):
+                    self.model.train()
+                    total_loss = 0
+                    
+                    for batch in train_loader:
+                        if model_type == "TimesNet":
+                            x_enc, x_mark_enc, x_dec, x_mark_dec, y = [b.to(device) for b in batch]
+                            optimizer.zero_grad()
+                            outputs = self.model(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                            loss = criterion(outputs, y)
+                        else:
+                            x, y = batch
+                            x, y = x.to(device), y.to(device)
+                            optimizer.zero_grad()
+                            outputs = self.model(x)
+                            loss = criterion(outputs, y)
+                        
+                        loss.backward()
+                        optimizer.step()
+                        total_loss += loss.item()
+                    
+                    if (epoch + 1) % 10 == 0:
+                        avg_loss = total_loss / len(train_loader)
+                        self.log(f"Epoch {epoch+1}/{epochs}: Loss = {avg_loss:.6f}")
+                
+                self.log("Training complete!")
+            
+            self.root.after(0, lambda: self.predict_btn.config(state='normal'))
+            self.root.after(0, lambda: self.save_model_btn.config(state='normal'))
+            
+        except Exception as e:
+            self.log(f"Training error: {str(e)}")
+        finally:
+            self.root.after(0, self.progress.stop)
+            self.root.after(0, lambda: self.train_btn.config(state='normal'))
+    
+    def generate_predictions(self):
+        """Generate predictions"""
+        if self.model is None:
+            return
+        
+        try:
+            self.log("Generating predictions...")
+            self.progress.start()
+            
+            gas_name = self.gas_selection.get()
+            seq_len = self.seq_len.get()
+            pred_len = self.pred_len.get()
+            future_periods = self.future_periods.get()
+            model_type = self.model_type.get()
+            
+            gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+            
+            # Prepare data
+            self.predictions_df = self.df.copy()
+            
+            # Add prediction columns
+            for col in gas_columns:
+                self.predictions_df[f'{col}_Predicted'] = np.nan
+            
+            # Process data
+            for col in gas_columns:
+                if col in self.predictions_df.columns:
+                    self.predictions_df[col] = pd.to_numeric(self.predictions_df[col], errors='coerce')
+                    self.predictions_df[col] = self.predictions_df[col].fillna(self.predictions_df[col].mean())
+            
+            data_values = self.predictions_df[gas_columns].values
+            data_normalized = self.scaler.transform(data_values)
+            
+            device = next(self.model.parameters()).device
+            self.model.eval()
+            
+            # Generate predictions
+            with torch.no_grad():
+                for i in range(len(self.predictions_df) - seq_len - pred_len + 1):
+                    if model_type == "TimesNet":
+                        # TimesNet needs special handling
+                        config = TimesNetConfig(gas_name, seq_len, pred_len)
+                        dataset = UniversalDataset(self.predictions_df.iloc[i:i+seq_len+pred_len], 
+                                                  gas_name, seq_len, pred_len, self.scaler, 'TimesNet')
+                        if len(dataset) > 0:
+                            x_enc, x_mark_enc, x_dec, x_mark_dec, _ = dataset[0]
+                            x_enc = x_enc.unsqueeze(0).to(device)
+                            x_mark_enc = x_mark_enc.unsqueeze(0).to(device)
+                            x_dec = x_dec.unsqueeze(0).to(device)
+                            x_mark_dec = x_mark_dec.unsqueeze(0).to(device)
+                            outputs = self.model(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                    elif model_type == "LSTM-Paper":
+                        # LSTM-Paper uses full sequence and predicts next step
+                        seq_x = data_normalized[i:i + seq_len]
+                        seq_x_tensor = torch.FloatTensor(seq_x).unsqueeze(0).to(device)
+                        outputs = self.model(seq_x_tensor)
+                        # Paper's model predicts one step at a time, so we need to loop for multi-step
+                        predictions = []
+                        current_seq = seq_x_tensor.clone()
+                        for _ in range(pred_len):
+                            next_pred = self.model(current_seq)
+                            predictions.append(next_pred)
+                            # Update sequence by removing first and adding prediction
+                            current_seq = torch.cat([current_seq[:, 1:, :], next_pred], dim=1)
+                        outputs = torch.cat(predictions, dim=1)
+                    else:
+                        seq_x = data_normalized[i:i + seq_len]
+                        seq_x_tensor = torch.FloatTensor(seq_x).unsqueeze(0).to(device)
+                        outputs = self.model(seq_x_tensor)
+                    
+                    predictions = outputs.cpu().numpy().squeeze()
+                    
+                    if len(gas_columns) == 1 and predictions.ndim == 1:
+                        predictions = predictions.reshape(-1, 1)
+                    elif pred_len == 1 and len(gas_columns) > 1:
+                        predictions = predictions.reshape(1, -1)
+                    
+                    pred_original = self.scaler.inverse_transform(predictions)
+                    
+                    for j in range(min(pred_len, len(self.predictions_df) - i - seq_len)):
+                        for k, col in enumerate(gas_columns):
+                            if len(gas_columns) == 1:
+                                value = pred_original[j, 0]
+                            else:
+                                value = pred_original[j, k]
+                            self.predictions_df.loc[i + seq_len + j, f'{col}_Predicted'] = value
+            
+            # Generate future predictions if requested
+            if future_periods > 0:
+                self.log(f"Generating {future_periods} future predictions...")
+                
+                # Get time delta based on pred_frequency selection
+                pred_freq = self.pred_frequency.get()
+                
+                # Map frequency to timedelta
+                if pred_freq == 'same':
+                    # Use detected frequency from data
+                    time_diffs = self.predictions_df['Timestamp'].diff().dropna()
+                    time_delta = time_diffs.median()
+                elif pred_freq == 'daily':
+                    time_delta = pd.Timedelta(days=1)
+                elif pred_freq == 'weekly':
+                    time_delta = pd.Timedelta(days=7)
+                elif pred_freq == 'monthly':
+                    time_delta = pd.Timedelta(days=30)
+                elif pred_freq == 'bimonthly':
+                    time_delta = pd.Timedelta(days=60)  # Approximately 2 months
+                elif pred_freq == 'yearly':
+                    time_delta = pd.Timedelta(days=365)  # Approximately 2 months
+                else:
+                    # Fallback to detected frequency
+                    time_diffs = self.predictions_df['Timestamp'].diff().dropna()
+                    time_delta = time_diffs.median()
+                
+                median_diff = time_delta
+                last_date = self.predictions_df['Timestamp'].max()
+                
+                # Get last window
+                last_values = self.predictions_df[gas_columns].tail(seq_len).values
+                last_values_normalized = self.scaler.transform(last_values)
+                
+                future_rows = []
+                current_window = last_values_normalized.copy()
+                
+                with torch.no_grad():
+                    for i in range(0, future_periods, pred_len):
+                        if model_type == "TimesNet":
+                            # TimesNet needs proper inputs
+                            seq_x_tensor = torch.FloatTensor(current_window).unsqueeze(0).to(device)
+                            # Create dummy time features for simplified prediction
+                            dummy_x_mark = torch.zeros(1, seq_len, 4).to(device)
+                            dummy_x_dec = torch.zeros(1, seq_len//2 + pred_len, len(gas_columns)).to(device)
+                            dummy_x_mark_dec = torch.zeros(1, seq_len//2 + pred_len, 4).to(device)
+                            outputs = self.model(seq_x_tensor, dummy_x_mark, dummy_x_dec, dummy_x_mark_dec)
+                        elif model_type == "LSTM-Paper":
+                            # LSTM-Paper: multi-step prediction
+                            seq_x_tensor = torch.FloatTensor(current_window).unsqueeze(0).to(device)
+                            predictions = []
+                            current_seq = seq_x_tensor.clone()
+                            for _ in range(min(pred_len, future_periods - i)):
+                                next_pred = self.model(current_seq)
+                                predictions.append(next_pred)
+                                current_seq = torch.cat([current_seq[:, 1:, :], next_pred], dim=1)
+                            outputs = torch.cat(predictions, dim=1) if predictions else self.model(seq_x_tensor)
+                        else:
+                            seq_x_tensor = torch.FloatTensor(current_window).unsqueeze(0).to(device)
+                            outputs = self.model(seq_x_tensor)
+                        
+                        predictions = outputs.cpu().numpy().squeeze()
+                        
+                        if len(gas_columns) == 1 and predictions.ndim == 1:
+                            predictions = predictions.reshape(-1, 1)
+                        elif predictions.ndim == 1:
+                            predictions = predictions.reshape(1, -1)
+                        
+                        pred_original = self.scaler.inverse_transform(predictions)
+                        
+                        for j in range(min(pred_len, future_periods - i)):
+                            future_date = last_date + median_diff * (i + j + 1)
+                            future_row = {'Timestamp': future_date}
+                            
+                            for col in gas_columns:
+                                future_row[col] = np.nan
+                            
+                            for k, col in enumerate(gas_columns):
+                                if len(gas_columns) == 1:
+                                    value = pred_original[j, 0]
+                                else:
+                                    value = pred_original[j, k]
+                                future_row[f'{col}_Predicted'] = max(0, value)
+                            
+                            future_rows.append(future_row)
+                        
+                        # Update window
+                        if future_periods - i > pred_len:
+                            current_window = np.vstack([current_window[pred_len:], predictions[:pred_len]])
+                
+                if future_rows:
+                    future_df = pd.DataFrame(future_rows)
+                    self.predictions_df = pd.concat([self.predictions_df, future_df], ignore_index=True)
+            
+            self.log("Predictions generated!")
+            self.save_btn.config(state='normal')
+            self.plot_btn.config(state='normal')
+            self.calc_error_btn.config(state='normal')  # Enable error analysis
+            
+        except Exception as e:
+            self.log(f"Prediction error: {str(e)}")
+        finally:
+            self.progress.stop()
+    
+    def save_results(self):
+        """Save results to Excel"""
+        if self.predictions_df is None:
+            return
+        
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")]
+            )
+            
+            if filename:
+                # Select columns to save
+                gas_name = self.gas_selection.get()
+                gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+                
+                cols_to_save = ['Timestamp']
+                for gas in gas_columns:
+                    if gas in self.predictions_df.columns:
+                        cols_to_save.append(gas)
+                    if f'{gas}_Predicted' in self.predictions_df.columns:
+                        cols_to_save.append(f'{gas}_Predicted')
+                
+                save_df = self.predictions_df[cols_to_save]
+                save_df.to_excel(filename, index=False)
+                self.log(f"Saved to {os.path.basename(filename)}")
+                messagebox.showinfo("Success", "File saved successfully!")
+        
+        except Exception as e:
+            self.log(f"Save error: {str(e)}")
+            messagebox.showerror("Error", str(e))
+    
+    def browse_model(self):
+        """Browse for saved model file"""
+        filename = filedialog.askopenfilename(
+            title="Select Saved Model",
+            filetypes=[("PyTorch model", "*.pth"), ("All files", "*.*")]
+        )
+        if filename:
+            self.loaded_model_path.set(filename)
+    
+    def load_saved_model(self):
+        """Load a previously saved model"""
+        if not self.loaded_model_path.get():
+            messagebox.showwarning("Warning", "Please select a model file first")
+            return
+        
+        try:
+            self.log("Loading saved model...")
+            
+            # Load the saved dictionary with proper security handling
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            checkpoint = torch.load(self.loaded_model_path.get(), map_location=device, weights_only=False)
+            
+            # Extract configuration
+            model_type = checkpoint['model_type']
+            seq_len = checkpoint['seq_len']
+            pred_len = checkpoint['pred_len']
+            gas_selection = checkpoint['gas_selection']
+            self.scaler = checkpoint['scaler']
+            
+            # Update GUI settings
+            self.model_type.set(model_type)
+            self.seq_len.set(seq_len)
+            self.pred_len.set(pred_len)
+            self.gas_selection.set(gas_selection)
+            
+            # Recreate model architecture
+            gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_selection == 'all' else [gas_selection]
+            enc_in = len(gas_columns)
+            
+            if model_type == "DLinear":
+                self.model = DLinear(seq_len, pred_len, enc_in).to(device)
+            elif model_type == "PatchTST":
+                self.model = PatchTST(seq_len, pred_len, enc_in).to(device)
+            elif model_type == "LSTM-Paper":
+                if gas_selection == 'all':
+                    self.model = LSTM_Paper(input_size=5, hidden_size=128, output_size=5).to(device)
+                else:
+                    self.model = LSTM_Paper(input_size=1, hidden_size=128, output_size=1).to(device)
+            elif model_type == "TimesNet":
+                config = TimesNetConfig(gas_selection, seq_len, pred_len)
+                self.model = TimesNetModel(config).to(device)
+            
+            # Load state dict
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.eval()
+            
+            # Update info label
+            info_text = f"Model loaded: {model_type} | Gas: {gas_selection} | Seq: {seq_len} | Pred: {pred_len}"
+            self.loaded_model_info.config(text=info_text, foreground='green')
+            
+            # Enable predict button if data is loaded
+            if self.df is not None:
+                self.predict_btn.config(state='normal')
+                self.save_model_btn.config(state='normal')
+            
+            self.log(f"Model loaded successfully: {os.path.basename(self.loaded_model_path.get())}")
+            messagebox.showinfo("Success", f"Model loaded!\n\nType: {model_type}\nGas: {gas_selection}\n\nYou can now make predictions without training!")
+            
+        except Exception as e:
+            self.log(f"Error loading model: {str(e)}")
+            messagebox.showerror("Error", f"Failed to load model: {str(e)}")
+    
+    def save_model(self):
+        """Save trained model"""
+        if self.model is None:
+            messagebox.showwarning("Warning", "No model to save")
+            return
+        
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pth",
+                filetypes=[("PyTorch model", "*.pth"), ("All files", "*.*")]
+            )
+            
+            if filename:
+                # Save model state dict and configuration
+                save_dict = {
+                    'model_state_dict': self.model.state_dict(),
+                    'model_type': self.model_type.get(),
+                    'seq_len': self.seq_len.get(),
+                    'pred_len': self.pred_len.get(),
+                    'gas_selection': self.gas_selection.get(),
+                    'scaler': self.scaler
+                }
+                torch.save(save_dict, filename)
+                self.log(f"Model saved to {os.path.basename(filename)}")
+                messagebox.showinfo("Success", "Model saved successfully!")
+        
+        except Exception as e:
+            self.log(f"Save model error: {str(e)}")
+            messagebox.showerror("Error", str(e))
+    
+    def plot_results(self):
+        """Plot results"""
+        if self.predictions_df is None:
+            return
+        
+        try:
+            gas_name = self.gas_selection.get()
+            gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+            
+            # Create plot window
+            plot_window = tk.Toplevel(self.root)
+            plot_window.title(f"Predictions - {self.model_type.get()}")
+            plot_window.geometry("1000x700")
+            
+            # Create figure
+            if gas_name == 'all':
+                fig, axes = plt.subplots(3, 2, figsize=(12, 10))
+                axes = axes.flatten()
+            else:
+                fig, axes = plt.subplots(1, 1, figsize=(10, 6))
+                axes = [axes]
+            
+            for idx, gas in enumerate(gas_columns):
+                if idx < len(axes):
+                    ax = axes[idx]
+                    
+                    # Separate historical and future
+                    historical_mask = self.predictions_df[gas].notna()
+                    future_mask = self.predictions_df[gas].isna() & self.predictions_df[f'{gas}_Predicted'].notna()
+                    
+                    # Plot actual
+                    if historical_mask.any():
+                        ax.plot(self.predictions_df.loc[historical_mask, 'Timestamp'],
+                               self.predictions_df.loc[historical_mask, gas],
+                               label='Actual', alpha=0.7, linewidth=1, color='blue')
+                    
+                    # Plot predictions
+                    pred_col = f'{gas}_Predicted'
+                    if pred_col in self.predictions_df.columns:
+                        if historical_mask.any():
+                            ax.plot(self.predictions_df.loc[historical_mask, 'Timestamp'],
+                                   self.predictions_df.loc[historical_mask, pred_col],
+                                   label='Predicted', alpha=0.7, linewidth=1, color='orange')
+                        
+                        if future_mask.any():
+                            ax.plot(self.predictions_df.loc[future_mask, 'Timestamp'],
+                                   self.predictions_df.loc[future_mask, pred_col],
+                                   label='Future', alpha=0.8, linewidth=2, 
+                                   linestyle='--', color='green')
+                            
+                            # Add vertical line at transition
+                            transition = self.predictions_df.loc[historical_mask, 'Timestamp'].max()
+                            ax.axvline(x=transition, color='red', linestyle=':', alpha=0.5)
+                    
+                    ax.set_title(f'{gas} Concentration')
+                    ax.set_xlabel('Date')
+                    ax.set_ylabel('Concentration')
+                    ax.legend(fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    ax.tick_params(axis='x', rotation=45)
+            
+            # Remove empty subplots
+            if gas_name == 'all' and len(gas_columns) < 6:
+                fig.delaxes(axes[5])
+            
+            plt.tight_layout()
+            
+            # Create frame for canvas and button
+            main_frame = ttk.Frame(plot_window)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Add save button
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+            
+            def save_plot():
+                try:
+                    filename = filedialog.asksaveasfilename(
+                        defaultextension=".png",
+                        filetypes=[("PNG files", "*.png"), ("PDF files", "*.pdf"), 
+                                  ("SVG files", "*.svg"), ("All files", "*.*")]
+                    )
+                    if filename:
+                        fig.savefig(filename, dpi=300, bbox_inches='tight')
+                        self.log(f"Plot saved to {os.path.basename(filename)}")
+                        messagebox.showinfo("Success", "Plot saved successfully!")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to save plot: {str(e)}")
+            
+            save_plot_btn = ttk.Button(button_frame, text="Save Plot", command=save_plot)
+            save_plot_btn.pack(side=tk.LEFT, padx=5)
+            
+            # Embed plot in tkinter
+            canvas = FigureCanvasTkAgg(fig, master=main_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
+            
+            self.log("Plot displayed")
+            
+        except Exception as e:
+            self.log(f"Plot error: {str(e)}")
+            messagebox.showerror("Error", str(e))
+    
+    def calculate_error_metrics(self):
+        """Calculate error metrics and create exportable data"""
+        if self.predictions_df is None:
+            messagebox.showwarning("Warning", "No predictions available.")
+            return
+
+        try:
+            self.log("Calculating error metrics...")
+
+            # Clear previous content
+            for widget in self.error_plot_frame.winfo_children():
+                widget.destroy()
+            for widget in self.metrics_frame.winfo_children():
+                widget.destroy()
+
+            # Create frame for export button and info
+            control_frame = ttk.Frame(self.metrics_frame)
+            control_frame.pack(fill='x', pady=5)
+
+            ttk.Label(control_frame, text="Error metrics calculated - See plots below", 
+                     font=('Arial', 10), foreground='green').pack(side=tk.LEFT, padx=5)
+
+            # Add export button
+            export_btn = ttk.Button(control_frame, text="Export Error Metrics to Excel", 
+                                   command=self.export_error_metrics)
+            export_btn.pack(side=tk.RIGHT, padx=5)
+
+            # Get gases
+            gas_name = self.gas_selection.get()
+            gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+
+            # Store error metrics for export
+            self.error_metrics_data = []
+
+            # Create figure
+            if gas_name == 'all':
+                fig, axes = plt.subplots(3, 2, figsize=(10, 12))
+                axes = axes.flatten()
+            else:
+                fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+                axes = [axes]
+
+            fig.suptitle(f'True vs Predicted - {self.model_type.get()}', fontsize=14, fontweight='bold')
+
+            # Create plots and collect metrics
+            for idx, gas in enumerate(gas_columns):
+                if gas not in self.predictions_df.columns or idx >= len(axes):
+                    continue
+
+                mask = self.predictions_df[gas].notna() & self.predictions_df[f'{gas}_Predicted'].notna()
+
+                if mask.sum() > 0:
+                    ax = axes[idx]
+
+                    y_true = self.predictions_df.loc[mask, gas].values
+                    y_pred = self.predictions_df.loc[mask, f'{gas}_Predicted'].values
+
+                    # Calculate metrics
+                    mae = np.mean(np.abs(y_true - y_pred))
+                    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+                    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-10))) * 100
+                    ss_res = np.sum((y_true - y_pred) ** 2)
+                    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+                    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0
+
+                    # Store metrics for export
+                    self.error_metrics_data.append({
+                        'Gas': gas,
+                        'MAE': mae,
+                        'RMSE': rmse,
+                        'MAPE (%)': mape,
+                        'R²': r2,
+                        'Sample_Count': mask.sum()
+                    })
+
+                    # Scatter plot
+                    ax.scatter(y_true, y_pred, alpha=0.6, s=20, color='blue')
+
+                    # Perfect prediction line
+                    min_val = min(y_true.min(), y_pred.min())
+                    max_val = max(y_true.max(), y_pred.max())
+                    ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+
+                    # Labels
+                    ax.set_xlabel('True')
+                    ax.set_ylabel('Predicted')
+                    ax.set_title(f'{gas}: MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.3f}')
+                    ax.grid(True, alpha=0.3)
+
+            # Remove empty subplots
+            if gas_name == 'all':
+                for idx in range(len(gas_columns), 6):
+                    if idx < len(axes):
+                        fig.delaxes(axes[idx])
+
+            plt.tight_layout()
+
+            # Embed plot
+            canvas = FigureCanvasTkAgg(fig, master=self.error_plot_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+
+            self.log("Error metrics calculated! Click 'Export Error Metrics to Excel' to save.")
+
+        except Exception as e:
+            self.log(f"Error: {str(e)}")
+            ttk.Label(self.error_plot_frame, text="Could not create plots", 
+                     foreground='red').pack(pady=20)
+
+    def export_error_metrics(self):
+        """Export error metrics and detailed error trends to Excel"""
+        if not hasattr(self, 'error_metrics_data') or not self.error_metrics_data:
+            messagebox.showwarning("Warning", "No error metrics to export. Calculate metrics first.")
+            return
+
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")],
+                initialfile=f"error_metrics_{self.model_type.get()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            )
+
+            if filename:
+                with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                    # Sheet 1: Summary metrics
+                    metrics_df = pd.DataFrame(self.error_metrics_data)
+                    metrics_df.to_excel(writer, sheet_name='Summary_Metrics', index=False)
+
+                    # Sheet 2: Detailed error trends
+                    gas_name = self.gas_selection.get()
+                    gas_columns = ['H2', 'CH4', 'C2H6', 'C2H4', 'C2H2'] if gas_name == 'all' else [gas_name]
+
+                    error_trends = []
+                    for gas in gas_columns:
+                        if gas in self.predictions_df.columns and f'{gas}_Predicted' in self.predictions_df.columns:
+                            mask = self.predictions_df[gas].notna() & self.predictions_df[f'{gas}_Predicted'].notna()
+                            if mask.sum() > 0:
+                                for idx in self.predictions_df[mask].index:
+                                    error_trends.append({
+                                        'Timestamp': self.predictions_df.loc[idx, 'Timestamp'],
+                                        'Gas': gas,
+                                        'Actual': self.predictions_df.loc[idx, gas],
+                                        'Predicted': self.predictions_df.loc[idx, f'{gas}_Predicted'],
+                                        'Error': self.predictions_df.loc[idx, gas] - self.predictions_df.loc[idx, f'{gas}_Predicted'],
+                                        'Absolute_Error': abs(self.predictions_df.loc[idx, gas] - self.predictions_df.loc[idx, f'{gas}_Predicted']),
+                                        'Percentage_Error': ((self.predictions_df.loc[idx, gas] - self.predictions_df.loc[idx, f'{gas}_Predicted']) / 
+                                                           (self.predictions_df.loc[idx, gas] + 1e-10)) * 100
+                                    })
+
+                    if error_trends:
+                        error_trends_df = pd.DataFrame(error_trends)
+                        error_trends_df.to_excel(writer, sheet_name='Error_Trends', index=False)
+
+                    # Sheet 3: Model configuration
+                    config_data = {
+                        'Parameter': ['Model Type', 'Sequence Length', 'Prediction Length', 
+                                     'Gas Selection', 'Training Mode', 'Epochs', 'Timestamp'],
+                        'Value': [self.model_type.get(), self.seq_len.get(), self.pred_len.get(),
+                                 self.gas_selection.get(), self.training_mode.get(), self.epochs.get(),
+                                 datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+                    }
+                    config_df = pd.DataFrame(config_data)
+                    config_df.to_excel(writer, sheet_name='Model_Config', index=False)
+
+                self.log(f"Error metrics exported to {os.path.basename(filename)}")
+                messagebox.showinfo("Success", f"Error metrics exported successfully!\n\nFile saved as:\n{os.path.basename(filename)}")
+
+        except Exception as e:
+            self.log(f"Export error: {str(e)}")
+            messagebox.showerror("Error", f"Failed to export metrics: {str(e)}")
+    
+    def update_metrics_table(self, metrics_dict):
+        """Not using tables anymore - just pass"""
+        pass
+
+
+# ============================================
+# MAIN
+# ============================================
+def main():
+    root = tk.Tk()
+    app = TimeSeriesGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
